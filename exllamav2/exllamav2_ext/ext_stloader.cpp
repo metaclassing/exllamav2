@@ -7,6 +7,7 @@
 #include <mutex>
 #include <deque>
 #include <condition_variable>
+#include <atomic>
 
 void stloader_read
 (
@@ -21,7 +22,6 @@ void stloader_read
     cudaStream_t stream;
 
     // Buffers
-
     uint8_t* load_buffer;
     uint8_t* cuda_buffer;
     if (target_cpu)
@@ -39,21 +39,30 @@ void stloader_read
     }
 
     // Synchronization
-
     Py_BEGIN_ALLOW_THREADS
 
-    volatile bool load_failed = false;
+    std::atomic<bool> load_failed{false};
+    std::atomic<bool> load_complete{false};
     std::mutex mtx;
     std::deque<std::pair<size_t, size_t>> dq;
     std::condition_variable cv;
+    
+    // Track total blocks for copy worker termination
+    size_t total_blocks = DIVIDE(size, STLOADER_BLOCK_SIZE);
+    std::atomic<size_t> blocks_produced{0};
 
-    // Load chunks
-
-    auto load_worker = [&] (size_t pos_a)
+    // Load chunks - each worker gets its own file handle
+    auto load_worker = [&] (size_t thread_id)
     {
         FILE* file = fopen(filename, "rb");
-        if (!file) goto error;
+        if (!file) {
+            load_failed = true;
+            cv.notify_all();
+            return;
+        }
 
+        size_t pos_a = thread_id * STLOADER_BLOCK_SIZE;
+        
         while (pos_a < size && !load_failed)
         {
             size_t pos_b = pos_a + STLOADER_BLOCK_SIZE;
@@ -61,63 +70,91 @@ void stloader_read
 
             #ifdef __linux__
                 ssize_t br = pread(fileno(file), load_buffer + pos_a, pos_b - pos_a, offset + pos_a);
-                if (br != pos_b - pos_a) goto error;
-                int sr = fseek(file, offset + pos_a, SEEK_SET);
+                if (br != (ssize_t)(pos_b - pos_a)) {
+                    if (!load_failed) {
+                        printf("Error reading file: %s (errno: %d)\n", strerror(errno), errno);
+                        load_failed = true;
+                    }
+                    break;
+                }
             #else
                 int sr = _fseeki64(file, static_cast<__int64>(offset + pos_a), SEEK_SET);
-                if (sr) goto error;
+                if (sr) {
+                    if (!load_failed) {
+                        printf("Error seeking file: %s (errno: %d)\n", strerror(errno), errno);
+                        load_failed = true;
+                    }
+                    break;
+                }
                 size_t br = fread(load_buffer + pos_a, 1, pos_b - pos_a, file);
-                if (br != pos_b - pos_a) goto error;
+                if (br != pos_b - pos_a) {
+                    if (!load_failed) {
+                        printf("Error reading file: %s (errno: %d)\n", strerror(errno), errno);
+                        load_failed = true;
+                    }
+                    break;
+                }
             #endif
 
+            // Add to queue atomically
             {
                 std::lock_guard<std::mutex> lock(mtx);
                 dq.push_back(std::pair<size_t, size_t>(pos_a, pos_b));
+                blocks_produced++;
                 cv.notify_one();
             }
 
-            // DBGX3(pos_a, pos_b, br);
             pos_a += STLOADER_THREADS * STLOADER_BLOCK_SIZE;
         }
 
         fclose(file);
-        return;
-
-        error:
-        if (file && ferror(file))
-            printf("Error reading file: %s (errno: %d)\n", strerror(errno), errno);
-        load_failed = true;
+        
+        // Notify that this worker is done
+        cv.notify_all();
     };
 
     // Copy chunks to device
-
     auto copy_worker = [&] ()
     {
+        if (!cuda_buffer) return; // No copying needed for CPU tensors
+        
         cudaSetDevice(device.value().index());
+        size_t blocks_processed = 0;
 
-        size_t total_blocks = DIVIDE(size, STLOADER_BLOCK_SIZE);
-        while (total_blocks && !load_failed)
+        while (blocks_processed < total_blocks && !load_failed)
         {
             size_t pos_a, pos_b;
+            
+            // Wait for data or completion
             {
                 std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [&dq] { return !dq.empty(); });
+                cv.wait(lock, [&] { 
+                    return !dq.empty() || load_failed || 
+                           (load_complete && blocks_produced == blocks_processed); 
+                });
+
+                if (dq.empty()) {
+                    if (load_failed || (load_complete && blocks_produced == blocks_processed)) {
+                        break;
+                    }
+                    continue;
+                }
 
                 auto pop = dq.front();
                 dq.pop_front();
-                total_blocks--;
                 pos_a = std::get<0>(pop);
                 pos_b = std::get<1>(pop);
 
+                // Coalesce contiguous blocks
                 while (!dq.empty() && std::get<0>(dq.front()) == pos_b)
                 {
                     pop = dq.front();
                     dq.pop_front();
                     pos_b = std::get<1>(pop);
-                    total_blocks--;
                 }
             }
 
+            // Copy to GPU
             cudaError_t cr = cudaMemcpyAsync
             (
                 cuda_buffer + pos_a,
@@ -126,32 +163,52 @@ void stloader_read
                 cudaMemcpyHostToDevice,
                 stream
             );
+            
             if (cr != cudaSuccess)
             {
-                fprintf(stderr,"GPUassert: %s\n", cudaGetErrorString(cr));
-                goto error;
+                fprintf(stderr,"CUDA error: %s\n", cudaGetErrorString(cr));
+                load_failed = true;
+                break;
             }
+            
+            blocks_processed++;
         }
-        return;
-
-        error:
-        load_failed = true;
     };
 
+    // Start worker threads
     std::vector<std::thread> threads;
+    
+    // Start load workers
     for (size_t i = 0; i < STLOADER_THREADS && i * STLOADER_BLOCK_SIZE < size; ++i)
-        threads.emplace_back(load_worker, i * STLOADER_BLOCK_SIZE);
+        threads.emplace_back(load_worker, i);
+    
+    // Start copy worker if needed
     if (cuda_buffer)
         threads.emplace_back(copy_worker);
-    for (auto& thread : threads)
-        thread.join();
+
+    // Wait for all load workers to complete
+    for (size_t i = 0; i < std::min(STLOADER_THREADS, size_t(threads.size())); ++i) {
+        if (i < threads.size()) {
+            threads[i].join();
+        }
+    }
+    
+    // Mark loading as complete
+    load_complete = true;
+    cv.notify_all();
+    
+    // Wait for copy worker if it exists
+    if (cuda_buffer && threads.size() > STLOADER_THREADS) {
+        threads.back().join();
+    }
 
     TORCH_CHECK(!load_failed, "I/O error reading tensor");
 
     if (!target_cpu)
     {
         free(load_buffer);
-        cudaDeviceSynchronize();
+        // Synchronize the specific stream instead of all streams
+        cudaStreamSynchronize(stream);
     }
 
     Py_END_ALLOW_THREADS
