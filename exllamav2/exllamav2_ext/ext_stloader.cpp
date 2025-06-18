@@ -81,7 +81,7 @@ auto load_worker = [&] (size_t pos_a)
             blocks_processed++;
         }
 
-        printf("[stloader] load_worker thread %zu processed %zu blocks\n", pos_a / (STLOADER_THREADS * STLOADER_BLOCK_SIZE), blocks_processed);
+        //printf("[stloader] load_worker thread %zu processed %zu blocks\n", pos_a / (STLOADER_THREADS * STLOADER_BLOCK_SIZE), blocks_processed);
 
         fclose(file);
         return;
@@ -149,7 +149,7 @@ auto load_worker = [&] (size_t pos_a)
             std::this_thread::yield();
         }
         blocks_copied_per_thread[stream_idx] = blocks_copied;
-        printf("[stloader] copy_worker thread %d copied %zu blocks\n", stream_idx, blocks_copied);
+        //printf("[stloader] copy_worker thread %d copied %zu blocks\n", stream_idx, blocks_copied);
         cudaStreamSynchronize(stream);
         cudaStreamDestroy(stream);
     };
