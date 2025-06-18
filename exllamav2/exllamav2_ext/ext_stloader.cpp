@@ -48,11 +48,12 @@ void stloader_read
 
     // Load chunks
 
-    auto load_worker = [&] (size_t pos_a)
-    {
-        size_t blocks_processed = 0;
-        FILE* file = fopen(filename, "rb");
-        if (!file) goto error;
+auto load_worker = [&] (size_t pos_a)
+{
+    size_t blocks_processed = 0;
+    printf("[stloader][debug] load_worker started with pos_a = %zu\n", pos_a);
+    FILE* file = fopen(filename, "rb");
+    if (!file) goto error;
 
         while (pos_a < size && !load_failed)
         {
@@ -70,11 +71,11 @@ void stloader_read
                 if (br != pos_b - pos_a) goto error;
             #endif
 
-            {
-                std::lock_guard<std::mutex> lock(mtx);
-                dq.push_back(std::pair<size_t, size_t>(pos_a, pos_b));
-                cv.notify_one();
-            }
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    dq.push_back(std::pair<size_t, size_t>(pos_a, pos_b));
+    cv.notify_all();
+}
 
             pos_a += STLOADER_THREADS * STLOADER_BLOCK_SIZE;
             blocks_processed++;
@@ -117,13 +118,13 @@ void stloader_read
                 pos_a = std::get<0>(pop);
                 pos_b = std::get<1>(pop);
 
-                // Optionally, coalesce adjacent blocks for efficiency (as before)
-                while (!dq.empty() && std::get<0>(dq.front()) == pos_b)
-                {
-                    pop = dq.front();
-                    dq.pop_front();
-                    pos_b = std::get<1>(pop);
-                }
+                // Remove coalescing: process only one block per wakeup for fairer thread distribution
+                // while (!dq.empty() && std::get<0>(dq.front()) == pos_b)
+                // {
+                //     pop = dq.front();
+                //     dq.pop_front();
+                //     pos_b = std::get<1>(pop);
+                // }
             }
 
             cudaError_t cr = cudaMemcpyAsync
@@ -141,6 +142,8 @@ void stloader_read
                 break;
             }
             blocks_copied++;
+            // Yield to improve fairness among threads
+            std::this_thread::yield();
         }
         printf("[stloader] copy_worker thread %d copied %zu blocks\n", stream_idx, blocks_copied);
         cudaStreamSynchronize(stream);
@@ -149,8 +152,50 @@ void stloader_read
 
     std::vector<std::thread> threads;
     size_t num_load_workers = 0;
+    std::vector<size_t> blocks_processed_per_thread;
     for (size_t i = 0; i < STLOADER_THREADS && i * STLOADER_BLOCK_SIZE < size; ++i) {
-        threads.emplace_back(load_worker, i * STLOADER_BLOCK_SIZE);
+        blocks_processed_per_thread.push_back(0);
+        threads.emplace_back([&, i](size_t pos_a) {
+            size_t blocks_processed = 0;
+            FILE* file = fopen(filename, "rb");
+            if (!file) goto error;
+
+            while (pos_a < size && !load_failed)
+            {
+                size_t pos_b = pos_a + STLOADER_BLOCK_SIZE;
+                if (pos_b > size) pos_b = size;
+
+                #ifdef __linux__
+                    ssize_t br = pread(fileno(file), load_buffer + pos_a, pos_b - pos_a, offset + pos_a);
+                    if (br != pos_b - pos_a) goto error;
+                    int sr = fseek(file, offset + pos_a, SEEK_SET);
+                #else
+                    int sr = _fseeki64(file, static_cast<__int64>(offset + pos_a), SEEK_SET);
+                    if (sr) goto error;
+                    size_t br = fread(load_buffer + pos_a, 1, pos_b - pos_a, file);
+                    if (br != pos_b - pos_a) goto error;
+                #endif
+
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    dq.push_back(std::pair<size_t, size_t>(pos_a, pos_b));
+                    cv.notify_one();
+                }
+
+                pos_a += STLOADER_THREADS * STLOADER_BLOCK_SIZE;
+                blocks_processed++;
+            }
+
+            blocks_processed_per_thread[i] = blocks_processed;
+
+            fclose(file);
+            return;
+
+            error:
+            if (file && ferror(file))
+                printf("Error reading file: %s (errno: %d)\n", strerror(errno), errno);
+            load_failed = true;
+        }, i * STLOADER_BLOCK_SIZE);
         num_load_workers++;
     }
 
@@ -164,6 +209,12 @@ void stloader_read
     // Wait for all load workers to finish
     for (size_t i = 0; i < num_load_workers; ++i)
         threads[i].join();
+
+    // Print thread statistics after all load workers complete
+    printf("[stloader][stats] Load worker summary:\n");
+    for (size_t i = 0; i < num_load_workers; ++i) {
+        printf("  load_worker[%zu] processed %zu blocks\n", i, blocks_processed_per_thread[i]);
+    }
 
     // Signal copy workers that loading is done
     {
