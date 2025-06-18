@@ -36,6 +36,37 @@ void stloader_read
         cudaSetDevice(device.value().index());
     }
 
+    // Parallel file read: read the file segment into load_buffer using multiple threads
+    size_t num_read_threads = STLOADER_THREADS;
+    size_t chunk_size = (size + num_read_threads - 1) / num_read_threads;
+    std::vector<std::thread> read_threads;
+    std::atomic<bool> read_failed(false);
+
+    for (size_t i = 0; i < num_read_threads; ++i) {
+        read_threads.emplace_back([&, i]() {
+            size_t start = i * chunk_size;
+            size_t end = std::min(start + chunk_size, size);
+            if (start >= end) return;
+            FILE* file = fopen(filename, "rb");
+            if (!file) {
+                read_failed = true;
+                return;
+            }
+            #ifdef __linux__
+                ssize_t br = pread(fileno(file), load_buffer + start, end - start, offset + start);
+                if (br != (ssize_t)(end - start)) read_failed = true;
+            #else
+                int sr = _fseeki64(file, static_cast<__int64>(offset + start), SEEK_SET);
+                if (sr) { read_failed = true; fclose(file); return; }
+                size_t br = fread(load_buffer + start, 1, end - start, file);
+                if (br != end - start) read_failed = true;
+            #endif
+            fclose(file);
+        });
+    }
+    for (auto& t : read_threads) t.join();
+    TORCH_CHECK(!read_failed, "Parallel file read failed");
+
     // Synchronization
 
     Py_BEGIN_ALLOW_THREADS
@@ -215,10 +246,12 @@ auto load_worker = [&] (size_t pos_a)
         threads[i].join();
 
     // Print thread statistics after all load workers complete
+/*
     printf("[stloader][stats] Load worker summary:\n");
     for (size_t i = 0; i < num_load_workers; ++i) {
         printf("  load_worker[%zu] processed %zu blocks\n", i, blocks_processed_per_thread[i]);
     }
+*/
 
     // Signal copy workers that loading is done
     {
@@ -232,6 +265,7 @@ auto load_worker = [&] (size_t pos_a)
         thread.join();
 
     // Print thread statistics after all copy workers complete
+    /*
     if (cuda_buffer)
     {
         printf("[stloader][stats] Copy worker summary:\n");
@@ -239,6 +273,7 @@ auto load_worker = [&] (size_t pos_a)
             printf("  copy_worker[%d] copied %zu blocks\n", i, blocks_copied_per_thread[i]);
         }
     }
+    */
 
     TORCH_CHECK(!load_failed, "I/O error reading tensor");
 

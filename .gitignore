@@ -9,3 +9,6 @@ dist
 
 # produced by `pip install -e .`
 exllamav2_ext.cpython-*.so
+
+.vscode
+*.pyd
