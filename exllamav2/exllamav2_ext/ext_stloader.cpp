@@ -94,6 +94,9 @@ auto load_worker = [&] (size_t pos_a)
 
     // Copy chunks to device (parallelized)
 
+    // Statistics for copy workers
+    std::vector<size_t> blocks_copied_per_thread(STLOADER_COPY_THREADS, 0);
+
     auto copy_worker = [&] (int stream_idx)
     {
         size_t blocks_copied = 0;
@@ -145,6 +148,7 @@ auto load_worker = [&] (size_t pos_a)
             // Yield to improve fairness among threads
             std::this_thread::yield();
         }
+        blocks_copied_per_thread[stream_idx] = blocks_copied;
         printf("[stloader] copy_worker thread %d copied %zu blocks\n", stream_idx, blocks_copied);
         cudaStreamSynchronize(stream);
         cudaStreamDestroy(stream);
@@ -226,6 +230,15 @@ auto load_worker = [&] (size_t pos_a)
     // Wait for all copy workers to finish
     for (auto& thread : copy_threads)
         thread.join();
+
+    // Print thread statistics after all copy workers complete
+    if (cuda_buffer)
+    {
+        printf("[stloader][stats] Copy worker summary:\n");
+        for (int i = 0; i < STLOADER_COPY_THREADS; ++i) {
+            printf("  copy_worker[%d] copied %zu blocks\n", i, blocks_copied_per_thread[i]);
+        }
+    }
 
     TORCH_CHECK(!load_failed, "I/O error reading tensor");
 
