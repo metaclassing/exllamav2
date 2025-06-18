@@ -7,8 +7,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#define STLOADER_BLOCK_SIZE (1*1024*1024)
-#define STLOADER_THREADS 8
+#define STLOADER_BLOCK_SIZE (4*1024*1024)
+#define STLOADER_THREADS 32
+#define STLOADER_COPY_THREADS 16
 
 void stloader_read
 (

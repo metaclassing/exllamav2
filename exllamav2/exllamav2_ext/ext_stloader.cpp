@@ -52,6 +52,7 @@ void stloader_read
 
     auto load_worker = [&] (size_t pos_a)
     {
+        size_t blocks_processed = 0;
         FILE* file = fopen(filename, "rb");
         if (!file) goto error;
 
@@ -78,7 +79,10 @@ void stloader_read
             }
 
             pos_a += STLOADER_THREADS * STLOADER_BLOCK_SIZE;
+            blocks_processed++;
         }
+
+        printf("[stloader] load_worker thread %zu processed %zu blocks\n", pos_a / (STLOADER_THREADS * STLOADER_BLOCK_SIZE), blocks_processed);
 
         fclose(file);
         return;
@@ -93,6 +97,7 @@ void stloader_read
 
     auto copy_worker = [&] (int stream_idx)
     {
+        size_t blocks_copied = 0;
         cudaSetDevice(device.value().index());
         cudaStream_t stream;
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
@@ -137,7 +142,9 @@ void stloader_read
                 load_failed = true;
                 break;
             }
+            blocks_copied++;
         }
+        printf("[stloader] copy_worker thread %d copied %zu blocks\n", stream_idx, blocks_copied);
         cudaStreamSynchronize(stream);
         cudaStreamDestroy(stream);
     };
