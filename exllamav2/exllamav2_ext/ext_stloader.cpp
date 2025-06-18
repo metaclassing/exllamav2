@@ -8,6 +8,8 @@
 #include <deque>
 #include <condition_variable>
 
+#define STLOADER_COPY_THREADS 4
+
 void stloader_read
 (
     const char* filename,
@@ -18,7 +20,6 @@ void stloader_read
 {
     c10::optional<torch::Device> device = torch::device_of(target);
     bool target_cpu = (device.has_value() && device->type() == torch::kCPU);
-    cudaStream_t stream;
 
     // Buffers
 
@@ -35,7 +36,6 @@ void stloader_read
         TORCH_CHECK(load_buffer, "Can't allocate buffer for tensor");
         cuda_buffer = (uint8_t*) target.data_ptr();
         cudaSetDevice(device.value().index());
-        stream = at::cuda::getCurrentCUDAStream(device.value().index()).stream();
     }
 
     // Synchronization
@@ -43,6 +43,7 @@ void stloader_read
     Py_BEGIN_ALLOW_THREADS
 
     volatile bool load_failed = false;
+    bool done_loading = false;
     std::mutex mtx;
     std::deque<std::pair<size_t, size_t>> dq;
     std::condition_variable cv;
@@ -76,7 +77,6 @@ void stloader_read
                 cv.notify_one();
             }
 
-            // DBGX3(pos_a, pos_b, br);
             pos_a += STLOADER_THREADS * STLOADER_BLOCK_SIZE;
         }
 
@@ -89,32 +89,37 @@ void stloader_read
         load_failed = true;
     };
 
-    // Copy chunks to device
+    // Copy chunks to device (parallelized)
 
-    auto copy_worker = [&] ()
+    auto copy_worker = [&] (int stream_idx)
     {
         cudaSetDevice(device.value().index());
+        cudaStream_t stream;
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 
-        size_t total_blocks = DIVIDE(size, STLOADER_BLOCK_SIZE);
-        while (total_blocks && !load_failed)
+        while (true)
         {
-            size_t pos_a, pos_b;
+            size_t pos_a = 0, pos_b = 0;
             {
                 std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [&dq] { return !dq.empty(); });
+                cv.wait(lock, [&dq, &load_failed, &done_loading] { return !dq.empty() || load_failed || done_loading; });
+                if (load_failed) break;
+                if (dq.empty()) {
+                    if (done_loading) break;
+                    continue;
+                }
 
                 auto pop = dq.front();
                 dq.pop_front();
-                total_blocks--;
                 pos_a = std::get<0>(pop);
                 pos_b = std::get<1>(pop);
 
+                // Optionally, coalesce adjacent blocks for efficiency (as before)
                 while (!dq.empty() && std::get<0>(dq.front()) == pos_b)
                 {
                     pop = dq.front();
                     dq.pop_front();
                     pos_b = std::get<1>(pop);
-                    total_blocks--;
                 }
             }
 
@@ -129,21 +134,41 @@ void stloader_read
             if (cr != cudaSuccess)
             {
                 fprintf(stderr,"GPUassert: %s\n", cudaGetErrorString(cr));
-                goto error;
+                load_failed = true;
+                break;
             }
         }
-        return;
-
-        error:
-        load_failed = true;
+        cudaStreamSynchronize(stream);
+        cudaStreamDestroy(stream);
     };
 
     std::vector<std::thread> threads;
-    for (size_t i = 0; i < STLOADER_THREADS && i * STLOADER_BLOCK_SIZE < size; ++i)
+    size_t num_load_workers = 0;
+    for (size_t i = 0; i < STLOADER_THREADS && i * STLOADER_BLOCK_SIZE < size; ++i) {
         threads.emplace_back(load_worker, i * STLOADER_BLOCK_SIZE);
+        num_load_workers++;
+    }
+
+    std::vector<std::thread> copy_threads;
     if (cuda_buffer)
-        threads.emplace_back(copy_worker);
-    for (auto& thread : threads)
+    {
+        for (int i = 0; i < STLOADER_COPY_THREADS; ++i)
+            copy_threads.emplace_back(copy_worker, i);
+    }
+
+    // Wait for all load workers to finish
+    for (size_t i = 0; i < num_load_workers; ++i)
+        threads[i].join();
+
+    // Signal copy workers that loading is done
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        done_loading = true;
+        cv.notify_all();
+    }
+
+    // Wait for all copy workers to finish
+    for (auto& thread : copy_threads)
         thread.join();
 
     TORCH_CHECK(!load_failed, "I/O error reading tensor");
