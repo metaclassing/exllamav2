@@ -8,8 +8,6 @@
 #include <deque>
 #include <condition_variable>
 
-#define STLOADER_COPY_THREADS 4
-
 void stloader_read
 (
     const char* filename,
